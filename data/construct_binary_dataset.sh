@@ -1,0 +1,1 @@
+srun -p CM2M -n 1 --cpus-per-task 32 python utils.py --output_dir /mnt/lustre/zhangle/projects/msat5/datasets/ --random_src --src_seq_per_msa_l 5 --src_seq_per_msa_u 10 --total_seq_per_msa 25 --local_file_path  /mnt/lustre/zhangle/projects/msat5/datasets/sorted_msa
