@@ -14,7 +14,14 @@
 **All the commands are designed for shlab cluster**
 
  1. Construct local binary dataset ( load training data from cluster is too slow, so it's better to  fisrt construct all your dataset to .bin file as shown in datasets )
- `srun -p CM2M -n 1 --cpus-per-task 32 python utils.py --output_dir /mnt/lustre/zhangle/projects/msat5/datasets/ --random_src --src_seq_per_msa_l 5 --src_seq_per_msa_u 10 --total_seq_per_msa 25 --local_file_path  /mnt/lustre/zhangle/projects/msat5/datasets/sorted_msa`
+ ```
+ srun -p CM2M -n 1 --cpus-per-task 32 python utils.py \
+ 	--output_dir /mnt/lustre/zhangle/projects/msat5/datasets/ \
+	--random_src --src_seq_per_msa_l 5\
+	--src_seq_per_msa_u 10 \
+	--total_seq_per_msa 25 \
+	--local_file_path  path to pretrained dataset   # e.g ./projects/msa_augmentor/datasets/sorted_msa
+ ```
  change the parameters above you can construct your own binary dataset
  
  2. Install dependent libraries, including pytorch transformer as well deepspeed.
