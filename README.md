@@ -1,4 +1,4 @@
-# msat5 pretraining code
+# MSA-Augmentor pretraining code
 
     |_config -> config settings for the model
     |_data -> .bin dataset construct pipeline
