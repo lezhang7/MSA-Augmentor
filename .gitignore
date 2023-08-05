@@ -1,0 +1,5 @@
+*.pyc
+output/
+dataset/
+checkpoints/
+pretraining_datasets/
