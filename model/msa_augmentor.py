@@ -12,31 +12,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" PyTorch T5 model."""
 
-
+import inspect
 import copy
 import math
 import os
 import warnings
 from numpy import False_
+from copy import deepcopy
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
-
+import torch.distributed as dist
 import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.utils.checkpoint import checkpoint
-
+from dataclasses import dataclass
 from transformers import LogitsProcessorList,StoppingCriteriaList,T5Config
-
+from transformers.generation.beam_constraints import Constraint, DisjunctiveConstraint, PhrasalConstraint
+from transformers.generation.beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
 from transformers.activations import ACT2FN
 from transformers.file_utils import (
     DUMMY_INPUTS,
     DUMMY_MASK,
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
     is_torch_fx_proxy,
-    replace_return_docstrings,
 )
 from transformers.modeling_outputs import (
     BaseModelOutput,
@@ -45,9 +43,34 @@ from transformers.modeling_outputs import (
     Seq2SeqModelOutput,
 )
 from transformers.modeling_utils import PreTrainedModel, find_pruneable_heads_and_indices, prune_linear_layer
-from transformers.utils import logging
+from transformers.utils import logging,ModelOutput
 from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
+from transformers.generation.stopping_criteria import (
+    MaxLengthCriteria,
+    MaxTimeCriteria,
+    StoppingCriteria,
+    StoppingCriteriaList,
+    validate_stopping_criteria,
+)
 
+from transformers.generation.logits_process import (
+    EncoderNoRepeatNGramLogitsProcessor,
+    ExponentialDecayLengthPenalty,
+    ForcedBOSTokenLogitsProcessor,
+    ForcedEOSTokenLogitsProcessor,
+    HammingDiversityLogitsProcessor,
+    InfNanRemoveLogitsProcessor,
+    LogitsProcessorList,
+    MinLengthLogitsProcessor,
+    NoBadWordsLogitsProcessor,
+    NoRepeatNGramLogitsProcessor,
+    PrefixConstrainedLogitsProcessor,
+    RepetitionPenaltyLogitsProcessor,
+    TemperatureLogitsWarper,
+    TopKLogitsWarper,
+    TopPLogitsWarper,
+    TypicalLogitsWarper,
+)
 
 
 logger = logging.get_logger(__name__)
@@ -179,63 +202,141 @@ def load_tf_weights_in_t5(model, config, tf_checkpoint_path):
     logger.info(f"Weights not copied to PyTorch model: {', '.join(tf_weights.keys())}.")
     return model
 
+@dataclass
+class SampleEncoderDecoderOutput(ModelOutput):
+    sequences: torch.LongTensor = None
+    scores: Optional[Tuple[torch.FloatTensor]] = None
+    encoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    encoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    decoder_attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    cross_attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    decoder_hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
 
-####################################################
-# PyTorch Models are constructed by sub-classing
-# - torch.nn.Module for the layers and
-# - PreTrainedModel for the models (it-self a sub-class of nn.Module)
-####################################################
-PARALLELIZE_DOCSTRING = r"""
-    This is an experimental feature and is a subject to change at a moment's notice.
+@dataclass
+class BeamSampleDecoderOnlyOutput(ModelOutput):
+    sequences: torch.LongTensor = None
+    sequences_scores: Optional[torch.FloatTensor] = None
+    scores: Optional[Tuple[torch.FloatTensor]] = None
+    beam_indices: Optional[Tuple[Tuple[torch.LongTensor]]] = None
+    attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+@dataclass
+class GreedySearchDecoderOnlyOutput(ModelOutput):
+ 
+    sequences: torch.LongTensor = None
+    scores: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
 
-    Uses a device map to distribute attention modules of the model across several devices. If no device map is given,
-    it will evenly distribute blocks across all devices.
+@dataclass
+class GreedySearchEncoderDecoderOutput(ModelOutput):
+   
+
+    sequences: torch.LongTensor = None
+    scores: Optional[Tuple[torch.FloatTensor]] = None
+    encoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    encoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    decoder_attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    cross_attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    decoder_hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+
+class MaxLengthCriteria(StoppingCriteria):
+
+    def __init__(self, max_length: int):
+        self.max_length = max_length
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        return input_ids.shape[-1] >= self.max_length
+class LogitsWarper:
+    """Abstract base class for all logit warpers that can be applied during generation with multinomial sampling."""
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        """Torch method for warping logits."""
+        raise NotImplementedError(
+            f"{self.__class__} is an abstract class. Only classes inheriting this class can be called."
+        )
+class MSATopPLogitsWarper(LogitsWarper):
+ 
+    def __init__(self, top_p: float, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
+        if not isinstance(top_p, float) or (top_p < 0 or top_p > 1.0):
+            raise ValueError(f"`top_p` has to be a float > 0 and < 1, but is {top_p}")
+ 
+        self.top_p = top_p
+        self.filter_value = filter_value
+        self.min_tokens_to_keep = min_tokens_to_keep
+ 
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        sorted_logits, sorted_indices = torch.sort(scores, descending=True)
+        cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+        # Remove tokens with cumulative top_p above the threshold (token with 0 are kept)
+        sorted_indices_to_remove = cumulative_probs > self.top_p
+        if self.min_tokens_to_keep > 1:
+            # Keep at least min_tokens_to_keep (set to min_tokens_to_keep-1 because we add the first one below)
+            sorted_indices_to_remove[..., : self.min_tokens_to_keep - 1] = 0
+        # Shift the indices to the right to keep also the first token above the threshold
+        #这里主要是为了保证第一个位置肯定能取到，将remove变量右移了一位，仔细思考其实这个对最终的结果影响并不大。
+        #举两个例子，[True,...True]全不要和[False,False,True,...,True]保留前面一部分
+        #对于第一个例子，右移一位其实没影响；对于第二个例子，右移相当于在False,True边界处多要了一个token，其他的并不会受到影响。
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        #保证留下第一个预测token，毕竟第一个token是cur-step中置信度最高的。
+        sorted_indices_to_remove[..., 0] = 0
+ 
+        # scatter sorted tensors to original indexing
+        # 这里跟英文的释义其实差不多，就是将sorted_indices_to_remove变量根据sorted_indices排序下标重新排列到与scores变量一一对应的位置，表示对于scores对应的值是否保留。
+        # 可以自己对排序后的logits按照排序下标indices进行scatter试试就知道了，会恢复到未排序前的初始状态。
+        # indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        indices_to_remove=torch.stack([i.scatter(1, j, i) for (i,j) in zip(sorted_indices_to_remove,sorted_indices)])
+        # 对remove变量中True部分对应的scores变量位置替换为self.filter_value(-inf)
+        scores = scores.masked_fill(indices_to_remove, self.filter_value)
+        return scores
+
+class LogitsProcessor:
+    """Abstract base class for all logit processors that can be applied during generation."""
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        """Torch method for processing logits."""
+        raise NotImplementedError(
+            f"{self.__class__} is an abstract class. Only classes inheriting this class can be called."
+        )
+class MSAMinLengthLogitsProcessor(LogitsProcessor):
+
+    def __init__(self, min_length: int, eos_token_id: int):
+        if not isinstance(min_length, int) or min_length < 0:
+            raise ValueError(f"`min_length` has to be a positive integer, but is {min_length}")
+
+        if not isinstance(eos_token_id, int) or eos_token_id < 0:
+            raise ValueError(f"`eos_token_id` has to be a positive integer, but is {eos_token_id}")
+
+        self.min_length = min_length
+        self.eos_token_id = eos_token_id
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        cur_len = input_ids.shape[-1]
+        if cur_len < self.min_length:
+            scores[:, :, self.eos_token_id] = -float("inf")
+        return scores
+
+class MSARepetitionPenaltyLogitsProcessor(LogitsProcessor):
+    r"""
+    [`LogitsProcessor`] enforcing an exponential penalty on repeated sequences.
 
     Args:
-        device_map (`Dict[int, list]`, optional, defaults to None):
-            A dictionary that maps attention modules to devices. Note that the embedding module and LMHead are always
-            automatically mapped to the first device (for esoteric reasons). That means that the first device should
-            have fewer attention modules mapped to it than other devices. For reference, the t5 models have the
-            following number of attention modules:
+        repetition_penalty (`float`):
+            The parameter for repetition penalty. 1.0 means no penalty. See [this
+            paper](https://arxiv.org/pdf/1909.05858.pdf) for more details.
+    """
 
-                - t5-small: 6
-                - t5-base: 12
-                - t5-large: 24
-                - t5-3b: 24
-                - t5-11b: 24
+    def __init__(self, penalty: float):
+        if not isinstance(penalty, float) or not (penalty > 0):
+            raise ValueError(f"`penalty` has to be a strictly positive float, but is {penalty}")
 
-    Example:
+        self.penalty = penalty
 
-    ```python
-    # Here is an example of a device map on a machine with 4 GPUs using t5-3b, which has a total of 24 attention modules:
-    model = MSAT5.from_pretrained("t5-3b")
-    device_map = {
-        0: [0, 1, 2],
-        1: [3, 4, 5, 6, 7, 8, 9],
-        2: [10, 11, 12, 13, 14, 15, 16],
-        3: [17, 18, 19, 20, 21, 22, 23],
-    }
-    model.parallelize(device_map)
-    ```
-"""
-DEPARALLELIZE_DOCSTRING = r"""
-    Moves the model to cpu from a model parallel state.
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        score = torch.gather(scores, 2, input_ids)
 
-    Example:
+        # if score < 0 then repetition penalty has to be multiplied to reduce the previous token probability
+        score = torch.where(score < 0, score * self.penalty, score / self.penalty)
 
-    ```python
-    # On a 4 GPU machine with t5-3b:
-    model = MSAT5.from_pretrained("t5-3b")
-    device_map = {
-        0: [0, 1, 2],
-        1: [3, 4, 5, 6, 7, 8, 9],
-        2: [10, 11, 12, 13, 14, 15, 16],
-        3: [17, 18, 19, 20, 21, 22, 23],
-    }
-    model.parallelize(device_map)  # Splits the model across several devices
-    model.deparallelize()  # Put the model back on cpu and cleans memory by calling torch.cuda.empty_cache()
-    ```
-"""
+        scores.scatter_(2, input_ids, score)
+        return scores
 class T5PreTrainedModel(PreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
@@ -331,36 +432,7 @@ class T5PreTrainedModel(PreTrainedModel):
 
         return shifted_input_ids
     
-    """Following methods Override original ones in GenerationMixin to adapte for MSA generatation process"""
-    def _prepare_attention_mask_for_generation(
-        self,
-        inputs: torch.Tensor,
-        pad_token_id: int,
-        eos_token_id: int,
-    ) -> torch.LongTensor:
-        is_msa_input_ids = len(inputs.shape) == 3 and inputs.dtype in [torch.int, torch.long]
-        is_pad_token_in_inputs = (pad_token_id is not None) and (pad_token_id in inputs)
-        is_pad_token_not_equal_to_eos_token_id = (eos_token_id is None) or (
-            (eos_token_id is not None) and (pad_token_id != eos_token_id)
-        )
-        # Check if input is input_ids and padded -> only then is attention_mask defined
-        if is_msa_input_ids and is_pad_token_in_inputs and is_pad_token_not_equal_to_eos_token_id:
-            return inputs.ne(pad_token_id).long()
-        else:
-            return torch.ones(inputs.shape[:3], dtype=torch.long, device=self.device)
-    def _prepare_decoder_input_ids_for_generation(
-        self,
-        batch_size: int,
-        decoder_start_token_id: int = None,
-        bos_token_id: int = None,
-        model_kwargs: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> torch.LongTensor:
-
-        if model_kwargs is not None and "decoder_input_ids" in model_kwargs:
-            return model_kwargs.pop("decoder_input_ids")
-        else:
-            decoder_start_token_id = self._get_decoder_start_token_id(decoder_start_token_id, bos_token_id)
-            return torch.ones((batch_size,self.config.seq_per_msa,1), dtype=torch.long, device=self.device) * decoder_start_token_id
+   
 
 
 class T5LayerNorm(nn.Module):
@@ -472,6 +544,7 @@ class T5Attention(nn.Module):
         self.inner_dim = self.n_heads * self.key_value_proj_dim
         self.has_tied_row_attention=has_tied_row_attention 
         self.debug=config.debug
+        self.debug_blank=16
         self.enc_col_attention=enc_col_attention
         self.dec_col_attention=dec_col_attention
         assert not (has_tied_row_attention and dec_col_attention),"Can't implement both tied_row_attention and decoder_column_attention"
@@ -591,10 +664,11 @@ class T5Attention(nn.Module):
         
         """
         # if self.is_decoder: 
-        #     print("T5Attention: hidden_states shape",hidden_states.shape)
-        #     print("T5Attention: past_key_value[0].shape",past_key_value[0].shape if past_key_value is not None else None)
-        #     print("T5Attention: query_length", query_length)
-        #     print("T5Attention: key_value_states", key_value_states.shape if key_value_states is not None else None)
+        if self.debug:
+            print(' '*self.debug_blank,"T5Attention: hidden_states shape",hidden_states.shape)
+            print(' '*self.debug_blank,"T5Attention: past_key_value[0].shape",past_key_value[0].shape if past_key_value is not None else None)
+            print(' '*self.debug_blank,"T5Attention: query_length", query_length)
+            print(' '*self.debug_blank,"T5Attention: key_value_states", key_value_states.shape if key_value_states is not None else None)
         batch_size,num_alignments,seq_length = hidden_states.shape[:3]
         real_seq_length = seq_length 
         # if self.debug and key_value_states is not None:
@@ -607,7 +681,7 @@ class T5Attention(nn.Module):
             real_seq_length += past_key_value[0].shape[3] if query_length is None else query_length
         key_length = real_seq_length if key_value_states is None else key_value_states.shape[2] 
         def shape(states):
-            return states.view(batch_size,num_alignments, -1, self.n_heads, self.key_value_proj_dim).transpose(2, 3) # (brcnd)->(brncd)
+            return states.view(states.size(0),states.size(1), -1, self.n_heads, self.key_value_proj_dim).transpose(2, 3) # (brcnd)->(brncd)
         def unshape(states):
             return states.transpose(2, 3).contiguous().view(batch_size,num_alignments, -1, self.inner_dim) #(brncd)->(brcd)
         def project(hidden_states, proj_layer, key_value_states, past_key_value):
@@ -640,8 +714,9 @@ class T5Attention(nn.Module):
         # calculate scores
         if self.dec_col_attention or self.enc_col_attention: 
             if query_states.size(3)!=key_states.size(3):#generate
-                cur_key_states=key_states[:,:,:,real_seq_length,:].unsqueeze(3)
-                mask=mask[:,:,:,:,real_seq_length].unsqueeze(4)
+                gen_attn_position=query_length-1
+                cur_key_states=key_states[:,:,:,gen_attn_position,:].unsqueeze(3)
+                mask=mask[:,:,:,:,gen_attn_position].unsqueeze(4)
                 # in this case, both q,k,v has length=1
                 scores = torch.einsum("bincd,bjncd->bncij", query_states, cur_key_states)
             else:
@@ -673,15 +748,17 @@ class T5Attention(nn.Module):
                 # print('!!!take last step of position_bias')
                 position_bias = position_bias[:, :, :, -hidden_states.size(2) :, :]
             if mask is not None:  
-                # print('position_bias shape',position_bias.shape)
-                # print('mask shape',mask.shape)
+                if self.debug:
+                    print(' '*self.debug_blank,'position_bias shape',position_bias.shape)
+                    print(' '*self.debug_blank,'mask shape',mask.shape)
                 position_bias = position_bias + mask  
                 
         if self.enc_col_attention or self.dec_col_attention:
             scores=scores+mask.permute(0,2,4,3,1) #(bnqr_1r_2)+(b1k1r_2)->(bnkr_1r_2)
         else:
-            # print('scores shape',scores.shape)
-            # print('position_bias shape',position_bias.shape)
+            if self.debug:
+                print(' '*self.debug_blank,'scores shape',scores.shape)
+                print(' '*self.debug_blank,'position_bias shape',position_bias.shape)
             scores +=position_bias
         attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
             scores
@@ -694,7 +771,7 @@ class T5Attention(nn.Module):
             
         if self.dec_col_attention or self.enc_col_attention:
             if query_states.size(3)!=key_states.size(3):#generate
-                 cur_value_states=value_states[:,:,:,real_seq_length,:].unsqueeze(3)
+                 cur_value_states=value_states[:,:,:,gen_attn_position,:].unsqueeze(3)
                  attn_output = unshape(torch.einsum("bncij,bncjd->bncid", attn_weights, cur_value_states.permute(0,2,3,1,4)).permute(0,3,1,2,4))
             else:
                 attn_output = unshape(torch.einsum("bncij,bncjd->bncid", attn_weights, value_states.permute(0,2,3,1,4)).permute(0,3,1,2,4))
@@ -721,7 +798,8 @@ class T5LayerSelfAttention(nn.Module):
         self.SelfAttention = T5Attention(config, has_relative_attention_bias=has_relative_attention_bias)#只有第零层才有relative attention
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
-
+        self.debug=config.debug
+        self.debug_blank=12
     def forward(
         self,
         hidden_states,
@@ -733,6 +811,8 @@ class T5LayerSelfAttention(nn.Module):
         output_attentions=False,
     ):
         normed_hidden_states = self.layer_norm(hidden_states)
+        if self.debug:
+            print(' '*self.debug_blank,'|Normal Self Attention|')
         attention_output = self.SelfAttention(
             normed_hidden_states,
             mask=attention_mask,
@@ -756,6 +836,8 @@ class T5LayerAxialAttention(nn.Module):
         self.layer_norm2 = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout1 = nn.Dropout(config.dropout_rate)
         self.dropout2 = nn.Dropout(config.dropout_rate)
+        self.debug=config.debug
+        self.debug_blank=12
 
     def forward(
         self,
@@ -769,6 +851,8 @@ class T5LayerAxialAttention(nn.Module):
     ):
         #Tied Row Attention
         normed_hidden_states = self.layer_norm1(hidden_states)
+        if self.debug:
+            print(' '*self.debug_blank,'|Self Tied-Row Attention|')
         attention_output_row = self.SelfRowAttention(
             normed_hidden_states,
             mask=attention_mask,
@@ -784,6 +868,8 @@ class T5LayerAxialAttention(nn.Module):
             position_bias=attention_output_row[2]
         # Column Attention
         normed_hidden_states=self.layer_norm2(hidden_states_row)
+        if self.debug:
+            print(' '*self.debug_blank,'|Self Column Attention|')
         attention_output_col = self.SelfColumnAttention(
             normed_hidden_states,
             mask=attention_mask,
@@ -817,7 +903,7 @@ class T5DecLayerColAttention(nn.Module):
         self.dropout1 = nn.Dropout(config.dropout_rate)
         self.dropout2 = nn.Dropout(config.dropout_rate)
         self.debug=config.debug
-
+        self.debug_blank=12
     def forward(
         self,
         hidden_states,
@@ -845,17 +931,19 @@ class T5DecLayerColAttention(nn.Module):
         #     print('attention_mask :',attention_mask)
             
         if self.msa_cross_model=="avg":
-            cross_key_value_states=torch.sum(key_value_states,1).unsqueeze(1).expand(hidden_states.shape).clone()/key_value_states.shape[1]
+            batch_size,_,seq_len,dim=key_value_states.shape
+            cross_key_value_states=torch.sum(key_value_states,1).unsqueeze(1).expand(batch_size,hidden_states.size(1),seq_len,dim).clone()/key_value_states.shape[1]
             
         elif self.msa_cross_model=="proj":
             cross_key_value_states=self.proj(key_value_states.transpose(1,3)).transpose(1,3).expand(key_value_states.shape).clone()
         else:
             cross_key_value_states=key_value_states
         normed_hidden_states = self.layer_norm1(hidden_states)
-        # print('-'*5,'EncDecAttention','-'*5)
+        if self.debug:
+            print(' '*self.debug_blank,'|Normal Cross Attention|')
         attention_output1 = self.EncDecAttention(
             normed_hidden_states,
-            mask=attention_mask,
+            mask=None, #cross_attn时，由于cross_key_value_states是自己变得，所以不要Mask
             key_value_states=cross_key_value_states,
             position_bias=position_bias,
             layer_head_mask=layer_head_mask,
@@ -868,7 +956,8 @@ class T5DecLayerColAttention(nn.Module):
         if position_bias is None:
             position_bias=attention_output1[2]
         normed_hidden_states2 = self.layer_norm2(hidden_states2)
-        # print('-'*5,'DecColAttention','-'*5)
+        if self.debug:
+            print(' '*self.debug_blank,'|Cross Column Attention|')
         attention_output2 = self.DecColAttention(
             normed_hidden_states2,
             mask=attention_mask,
@@ -901,6 +990,7 @@ class T5LayerCrossAttention(nn.Module):
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
         self.debug=config.debug
+        self.debug_blank=12
 
     def forward(
         self,
@@ -942,7 +1032,8 @@ class T5Block(nn.Module):
         self.is_decoder = config.is_decoder
         self.layer = nn.ModuleList()
         self.axial_attention=config.axial_attention
-        
+        self.debug=config.debug
+        self.debug_blank=8
         if self.axial_attention:
             self.layer.append(T5LayerAxialAttention(config, has_relative_attention_bias=has_relative_attention_bias))
         else:
@@ -1007,8 +1098,9 @@ class T5Block(nn.Module):
             cross_col_attn_past_key_value=past_key_value[4:]
         else:
             self_attn_past_key_value, cross_attn_past_key_value,cross_col_attn_past_key_value = None, None, None
-        # if self.is_decoder:
-        #     print('--'*5,'self-attention')
+        if self.debug:
+            print(' '*self.debug_blank,'-'*30)
+            print(' '*self.debug_blank,'|T5Block --> Self-attention')
         self_attention_outputs = self.layer[0](
             hidden_states,
             attention_mask=attention_mask,
@@ -1039,7 +1131,10 @@ class T5Block(nn.Module):
                 query_length = present_key_value_state[0].shape[3]
             else:
                 query_length = None
-         
+            if self.debug:
+                print(' '*self.debug_blank,'-'*30)
+                print(' '*self.debug_blank,'|T5Block --> Cross-attention')
+                
             cross_attention_outputs = self.layer[1](
                 hidden_states,
                 key_value_states=encoder_hidden_states,
@@ -1119,8 +1214,8 @@ class T5Stack(T5PreTrainedModel):
         self.model_parallel = False
         self.device_map = None
         self.gradient_checkpointing = False
-
-    @add_start_docstrings(PARALLELIZE_DOCSTRING)
+        self.debug=config.debug
+        self.debug_blank=4
     def parallelize(self, device_map=None):
         # Check validity of device_map
         self.device_map = (
@@ -1141,7 +1236,6 @@ class T5Stack(T5PreTrainedModel):
         # Set final layer norm to last device
         self.final_layer_norm = self.final_layer_norm.to(self.last_device)
 
-    @add_start_docstrings(PARALLELIZE_DOCSTRING)
     def deparallelize(self):
         self.model_parallel = False
         self.device_map = None
@@ -1224,6 +1318,7 @@ class T5Stack(T5PreTrainedModel):
             encoder_attention_mask = torch.ones( 
                batch_size,num_alignments,encoder_seq_length, device=inputs_embeds.device, dtype=torch.long
             )
+      
 
         # initialize past_key_values with `None` if past does not exist
         if past_key_values is None:
@@ -1233,6 +1328,8 @@ class T5Stack(T5PreTrainedModel):
         # ourselves in which case we just need to make it broadcastable to all heads.
         
         extended_attention_mask = torch.stack([self.get_extended_attention_mask(a, i.shape, inputs_embeds.device) for (a,i) in zip(attention_mask,input_ids)],0) # [batch,row,1,seq,seq] for decoder ; [batch,row,1,1,seq] for encoder
+        if self.debug:
+            print(' '*self.debug_blank,'T5Stack: extended_attention_mask',extended_attention_mask)
 
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
@@ -1242,6 +1339,8 @@ class T5Stack(T5PreTrainedModel):
             if encoder_attention_mask is None:
                 encoder_attention_mask = torch.ones(encoder_hidden_shape, device=inputs_embeds.device)
             encoder_extended_attention_mask = torch.stack([self.invert_attention_mask(eam) for eam in encoder_attention_mask],0)
+            if self.debug:
+                print(' '*self.debug_blank,'T5Stack: encoder_extended_attention_mask',encoder_extended_attention_mask)
         else:
             encoder_extended_attention_mask = None
 
@@ -1260,12 +1359,15 @@ class T5Stack(T5PreTrainedModel):
         hidden_states = self.dropout(inputs_embeds)
 
         for i, (layer_module, past_key_value) in enumerate(zip(self.block, past_key_values)):
-            # if self.is_decoder:
-            #     print('-'*15,'go to layer {}'.format(i),'-'*15)
-            #     if past_key_value is None:
-            #         print('past_key_value is None')
-            #     else:
-            #         print('past_key_value shape ',len(past_key_value),past_key_value[0].shape)
+            if self.debug:
+                if self.is_decoder:
+                    print(' '*self.debug_blank,'Decoder Block {}'.format(i))
+                else:
+                    print(' '*self.debug_blank,'Encoder Block {}'.format(i))
+                if past_key_value is None:
+                    print(' '*self.debug_blank,'past_key_value is None')
+                else:
+                    print(' '*self.debug_blank,'past_key_value shape ',len(past_key_value),past_key_value[0].shape)
             layer_head_mask = head_mask[i] #usually None
             cross_attn_layer_head_mask = cross_attn_head_mask[i] #usually None
             # Model parallel
@@ -1388,157 +1490,6 @@ class T5Stack(T5PreTrainedModel):
         )
 
 
-T5_START_DOCSTRING = r"""
-
-    The T5 model was proposed in [Exploring the Limits of Transfer Learning with a Unified Text-to-Text
-    Transformer](https://arxiv.org/abs/1910.10683) by Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan
-    Narang, Michael Matena, Yanqi Zhou, Wei Li, Peter J. Liu. It's an encoder decoder transformer pre-trained in a
-    text-to-text denoising generative setting.
-
-    This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
-    library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
-    etc.)
-
-    This model is also a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) subclass.
-    Use it as a regular PyTorch Module and refer to the PyTorch documentation for all matter related to general usage
-    and behavior.
-
-    Parameters:
-        config ([`T5Config`]): Model configuration class with all the parameters of the model.
-            Initializing with a config file does not load the weights associated with the model, only the
-            configuration. Check out the [`~PreTrainedModel.from_pretrained`] method to load the model weights.
-"""
-
-T5_INPUTS_DOCSTRING = r"""
-    Args:
-        input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-            Indices of input sequence tokens in the vocabulary. T5 is a model with relative position embeddings so you
-            should be able to pad the inputs on both the right and the left.
-
-            Indices can be obtained using [`T5Tokenizer`]. See [`PreTrainedTokenizer.encode`] and
-            [`PreTrainedTokenizer.__call__`] for detail.
-
-            [What are input IDs?](../glossary#input-ids)
-
-            To know more on how to prepare `input_ids` for pretraining take a look a [T5 Training](./t5#training).
-        attention_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
-            - 1 for tokens that are **not masked**,
-            - 0 for tokens that are **masked**.
-
-            [What are attention masks?](../glossary#attention-mask)
-        decoder_input_ids (`torch.LongTensor` of shape `(batch_size, target_sequence_length)`, *optional*):
-            Indices of decoder input sequence tokens in the vocabulary.
-
-            Indices can be obtained using [`T5Tokenizer`]. See [`PreTrainedTokenizer.encode`] and
-            [`PreTrainedTokenizer.__call__`] for details.
-
-            [What are decoder input IDs?](../glossary#decoder-input-ids)
-
-            T5 uses the `pad_token_id` as the starting token for `decoder_input_ids` generation. If `past_key_values`
-            is used, optionally only the last `decoder_input_ids` have to be input (see `past_key_values`).
-
-            To know more on how to prepare `decoder_input_ids` for pretraining take a look at [T5
-            Training](./t5#training).
-        decoder_attention_mask (`torch.BoolTensor` of shape `(batch_size, target_sequence_length)`, *optional*):
-            Default behavior: generate a tensor that ignores pad tokens in `decoder_input_ids`. Causal mask will also
-            be used by default.
-        head_mask (`torch.FloatTensor` of shape `(num_heads,)` or `(num_layers, num_heads)`, *optional*):
-            Mask to nullify selected heads of the self-attention modules in the encoder. Mask values selected in `[0,
-            1]`:
-
-            - 1 indicates the head is **not masked**,
-            - 0 indicates the head is **masked**.
-
-        decoder_head_mask (`torch.FloatTensor` of shape `(num_heads,)` or `(num_layers, num_heads)`, *optional*):
-            Mask to nullify selected heads of the self-attention modules in the decoder. Mask values selected in `[0,
-            1]`:
-
-            - 1 indicates the head is **not masked**,
-            - 0 indicates the head is **masked**.
-
-        cross_attn_head_mask (`torch.Tensor` of shape `(num_heads,)` or `(num_layers, num_heads)`, *optional*):
-                Mask to nullify selected heads of the cross-attention modules in the decoder. Mask values selected in
-                `[0, 1]`:
-
-                - 1 indicates the head is **not masked**,
-                - 0 indicates the head
-                 is **masked**
-        encoder_outputs (`tuple(tuple(torch.FloatTensor)`, *optional*)): 
-            Tuple consists of (`last_hidden_state`, `optional`: *hidden_states*, `optional`: *attentions*)
-            `last_hidden_state` of shape `(batch_size, sequence_length, hidden_size)` is a sequence of hidden states at
-            the output of the last layer of the encoder. Used in the cross-attention of the decoder.
-        past_key_values (`tuple(tuple(torch.FloatTensor))` of length `config.n_layers` with each tuple having 4 tensors of shape `(batch_size, num_heads, sequence_length - 1, embed_size_per_head)`):
-            Contains precomputed key and value hidden states of the attention blocks. Can be used to speed up decoding.
-
-            If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those that
-            don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of all
-            `decoder_input_ids` of shape `(batch_size, sequence_length)`.
-        inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-            Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation. This
-            is useful if you want more control over how to convert `input_ids` indices into associated vectors than the
-            model's internal embedding lookup matrix.
-        decoder_inputs_embeds (`torch.FloatTensor` of shape `(batch_size, target_sequence_length, hidden_size)`, *optional*):
-            Optionally, instead of passing `decoder_input_ids` you can choose to directly pass an embedded
-            representation. If `past_key_values` is used, optionally only the last `decoder_inputs_embeds` have to be
-            input (see `past_key_values`). This is useful if you want more control over how to convert
-            `decoder_input_ids` indices into associated vectors than the model's internal embedding lookup matrix.
-
-            If `decoder_input_ids` and `decoder_inputs_embeds` are both unset, `decoder_inputs_embeds` takes the value
-            of `inputs_embeds`.
-
-        use_cache (`bool`, *optional*):
-            If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
-            `past_key_values`).
-
-        output_attentions (`bool`, *optional*):
-            Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
-            tensors for more detail.
-        output_hidden_states (`bool`, *optional*):
-            Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
-            more detail.
-        return_dict (`bool`, *optional*):
-            Whether or not to return a [`~file_utils.ModelOutput`] instead of a plain tuple.
-"""
-
-T5_ENCODER_INPUTS_DOCSTRING = r"""
-    Args:
-        input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-            Indices of input sequence tokens in the vocabulary. T5 is a model with relative position embeddings so you
-            should be able to pad the inputs on both the right and the left.
-
-            Indices can be obtained using [`T5Tokenizer`]. See [`PreTrainedTokenizer.encode`] and
-            [`PreTrainedTokenizer.__call__`] for detail.
-
-            To know more on how to prepare `input_ids` for pretraining take a look a [T5 Training](./t5#training).
-        attention_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
-            - 1 for tokens that are **not masked**,
-            - 0 for tokens that are **masked**.
-
-            [What are attention masks?](../glossary#attention-mask)
-        head_mask (`torch.FloatTensor` of shape `(num_heads,)` or `(num_layers, num_heads)`, *optional*):
-            Mask to nullify selected heads of the self-attention modules. Mask values selected in `[0, 1]`:
-
-            - 1 indicates the head is **not masked**,
-            - 0 indicates the head is **masked**.
-
-        inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-            Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation. This
-            is useful if you want more control over how to convert `input_ids` indices into associated vectors than the
-            model's internal embedding lookup matrix.
-        output_attentions (`bool`, *optional*):
-            Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
-            tensors for more detail.
-        output_hidden_states (`bool`, *optional*):
-            Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
-            more detail.
-        return_dict (`bool`, *optional*):
-            Whether or not to return a [`~file_utils.ModelOutput`] instead of a plain tuple.
-"""
-
 # Warning message for FutureWarning: head_mask was separated into two input args - head_mask, decoder_head_mask
 __HEAD_MASK_WARNING_MSG = """
 The input argument `head_mask` was split into two arguments `head_mask` and `decoder_head_mask`. Currently,
@@ -1548,7 +1499,8 @@ num_heads)`. """
 
 
 
-class MSA_AUGMENTOR(T5PreTrainedModel):
+
+class MSAT5(T5PreTrainedModel):
     _keys_to_ignore_on_load_missing = [
         r"encoder\.embed_tokens\.weight",
         r"decoder\.embed_tokens\.weight",
@@ -1595,7 +1547,7 @@ class MSA_AUGMENTOR(T5PreTrainedModel):
         self.model_parallel = False
         self.device_map = None
 
-    @add_start_docstrings(PARALLELIZE_DOCSTRING)
+ 
     def parallelize(self, device_map=None):
         self.device_map = (
             get_device_map(len(self.encoder.block), range(torch.cuda.device_count()))
@@ -1608,7 +1560,7 @@ class MSA_AUGMENTOR(T5PreTrainedModel):
         self.lm_head = self.lm_head.to(self.decoder.first_device)
         self.model_parallel = True
 
-    @add_start_docstrings(DEPARALLELIZE_DOCSTRING)
+
     def deparallelize(self):
         self.encoder.deparallelize()
         self.decoder.deparallelize()
@@ -1658,7 +1610,20 @@ class MSA_AUGMENTOR(T5PreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
     ):
-       
+        if self.debug:
+            print('-'*75)
+            print('|',' '*27,'New forward step',' '*26,'|')
+            print('-'*75)
+            print('| %-25s'%'input_ids shape','%47s'%'{}|'.format(input_ids.shape if input_ids is not None else None))
+            print('| %-25s'%'labels shape','%47s'%'{}|'.format(labels.shape if labels is not None else None))
+            print('| %-25s'%'attention_mask shape','%47s'%'{}|'.format(attention_mask.shape if attention_mask is not None else None))
+            print('| %-25s'%'decoder_input_ids shape','%47s'%'{}|'.format(decoder_input_ids.shape if decoder_input_ids is not None else None))
+            print('| %-25s'%'past_key_values','%47s'%'{}|'.format(bool(past_key_values)))
+            print('| %-25s'%'use_cache is','%47s'%'{}|'.format(bool(use_cache)))
+            print('| %-25s'%'output_attentions','%47s'%'{}|'.format(bool(output_attentions)))
+            print('| %-25s'%'output_hidden_states','%47s'%'{}|'.format(bool(output_hidden_states)))
+            print('| %-25s'%'return_dict','%47s'%'{}|'.format(bool(return_dict)))
+            print('-'*75)
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1675,6 +1640,8 @@ class MSA_AUGMENTOR(T5PreTrainedModel):
         # Encode if needed (training, first prediction pass)
         if encoder_outputs is None:
             # Convert encoder inputs in embeddings if needed
+            if self.debug:
+                print('*'*25,'INTO Encoder(Stack)','*'*25)
             encoder_outputs = self.encoder(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -1719,7 +1686,8 @@ class MSA_AUGMENTOR(T5PreTrainedModel):
         #     print('encoder hidden_states shape',hidden_states.shape)
         #     print('\n')
         # Decode
-       
+        if self.debug:
+            print('*'*25,'INTO Decoder(Stack)','*'*25)
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
@@ -1753,7 +1721,16 @@ class MSA_AUGMENTOR(T5PreTrainedModel):
             sequence_output = sequence_output * (self.model_dim**-0.5)
 
         lm_logits = self.lm_head(sequence_output)
-
+        if self.debug:
+            print('-'*75)
+            print('\nThis forward step is over, outputs are')
+            print('| %-25s'%'input_ids shape','%47s'%'{}|'.format(input_ids.shape if input_ids is not None else None))
+            print('| %-25s'%'decoder_input_ids shape','%47s'%'{}|'.format(decoder_input_ids.shape if decoder_input_ids is not None else None))
+            print('| %-25s'%'lm_logits shape','%47s'%'{}|'.format(lm_logits.shape))
+            print('| %-25s'%'labels shape','%47s'%'{}|'.format(labels.shape if labels is not None else None))
+            print('-'*75)
+          
+          
         loss = None
         if labels is not None:
             loss_fct = CrossEntropyLoss(ignore_index=-100)
@@ -1775,7 +1752,38 @@ class MSA_AUGMENTOR(T5PreTrainedModel):
             encoder_hidden_states=encoder_outputs.hidden_states,
             encoder_attentions=encoder_outputs.attentions,
         )
+    """Following methods Override original ones in GenerationMixin to adapte for MSA generatation process"""
+    def _prepare_attention_mask_for_generation(
+        self,
+        inputs: torch.Tensor,
+        pad_token_id: int,
+        eos_token_id: int,
+    ) -> torch.LongTensor:
+        is_msa_input_ids = len(inputs.shape) == 3 and inputs.dtype in [torch.int, torch.long]
+        is_pad_token_in_inputs = (pad_token_id is not None) and (pad_token_id in inputs)
+        is_pad_token_not_equal_to_eos_token_id = (eos_token_id is None) or (
+            (eos_token_id is not None) and (pad_token_id != eos_token_id)
+        )
+        # Check if input is input_ids and padded -> only then is attention_mask defined
+        if is_msa_input_ids and is_pad_token_in_inputs and is_pad_token_not_equal_to_eos_token_id:
+            return inputs.ne(pad_token_id).long()
+        else:
+            return torch.ones(inputs.shape[:3], dtype=torch.long, device=self.device)
+    def _prepare_decoder_MSA_input_ids_for_generation(
+        self,
+        batch_size: int,
+        decoder_start_token_id: int = None, 
+        bos_token_id: int = None,
+        model_kwargs: Optional[Dict[str, torch.Tensor]] = None,
+        device: torch.device = None,
+        gen_seq_num:int=10,
+    ) -> torch.LongTensor:
 
+        if model_kwargs is not None and "decoder_input_ids" in model_kwargs:
+            return model_kwargs.pop("decoder_input_ids")
+        else:
+            decoder_start_token_id = self._get_decoder_start_token_id(decoder_start_token_id, bos_token_id)
+            return torch.ones((batch_size,gen_seq_num,1), dtype=torch.long, device=device) * decoder_start_token_id
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -1829,6 +1837,691 @@ class MSA_AUGMENTOR(T5PreTrainedModel):
 
             reordered_decoder_past = reordered_decoder_past + (reordered_layer_past_states,)
         return reordered_decoder_past
+
+    @torch.no_grad()
+    def generate(
+        self,
+        inputs: Optional[torch.Tensor] = None,
+        max_length: Optional[int] = None,
+        min_length: Optional[int] = None,
+        do_sample: Optional[bool] = None,
+        early_stopping: Optional[bool] = None,
+        num_beams: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        typical_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        bad_words_ids: Optional[Iterable[int]] = None,
+        force_words_ids: Optional[Union[Iterable[int], Iterable[Iterable[int]]]] = None,
+        bos_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        length_penalty: Optional[float] = None,
+        no_repeat_ngram_size: Optional[int] = None,
+        encoder_no_repeat_ngram_size: Optional[int] = None,
+        num_return_sequences: Optional[int] = None,
+        max_time: Optional[float] = None,
+        max_new_tokens: Optional[int] = None,
+        decoder_start_token_id: Optional[int] = None,
+        use_cache: Optional[bool] = None,
+        num_beam_groups: Optional[int] = None,
+        diversity_penalty: Optional[float] = None,
+        prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
+        logits_processor: Optional[LogitsProcessorList] = LogitsProcessorList(),
+        renormalize_logits: Optional[bool] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = StoppingCriteriaList(),
+        constraints: Optional[List[Constraint]] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_scores: Optional[bool] = None,
+        return_dict_in_generate: Optional[bool] = None,
+        forced_bos_token_id: Optional[int] = None,
+        forced_eos_token_id: Optional[int] = None,
+        remove_invalid_values: Optional[bool] = None,
+        synced_gpus: Optional[bool] = False,
+        exponential_decay_length_penalty: Optional[Tuple[Union[int, float]]] = None,
+        gen_seq_num=10,
+        **model_kwargs,
+    ) :
+        
+        # 1. Set generation parameters if not already defined
+        bos_token_id = bos_token_id if bos_token_id is not None else self.config.bos_token_id
+        num_beams = num_beams if num_beams is not None else self.config.num_beams
+        length_penalty = length_penalty if length_penalty is not None else self.config.length_penalty
+        early_stopping = early_stopping if early_stopping is not None else self.config.early_stopping
+        num_beam_groups = num_beam_groups if num_beam_groups is not None else self.config.num_beam_groups
+        do_sample = do_sample if do_sample is not None else self.config.do_sample
+        num_return_sequences = (
+            num_return_sequences if num_return_sequences is not None else self.config.num_return_sequences
+        )
+
+        pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
+        eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
+
+        if eos_token_id is None and hasattr(self.config, "decoder"):
+            eos_token_id = self.config.decoder.eos_token_id
+
+        if pad_token_id is None and eos_token_id is not None:
+            # special case if pad_token_id is not defined
+            logger.warning(f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation.")
+            pad_token_id = eos_token_id
+
+        output_scores = output_scores if output_scores is not None else self.config.output_scores
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict_in_generate = (
+            return_dict_in_generate if return_dict_in_generate is not None else self.config.return_dict_in_generate
+        )
+
+        # 2. Define model inputs
+        # inputs_tensor has to be defined
+        # model_input_name is defined if model-specific keyword input is passed
+        # otherwise model_input_name is None
+        # all model-specific keyword inputs are removed from `model_kwargs`
+        inputs_tensor, model_input_name, model_kwargs = self._prepare_model_inputs(inputs, bos_token_id, model_kwargs)
+        batch_size = inputs_tensor.shape[0]
+
+        # 3. Define other model kwargs
+        model_kwargs["output_attentions"] = output_attentions
+        model_kwargs["output_hidden_states"] = output_hidden_states
+        model_kwargs["use_cache"] = use_cache
+
+        accepts_attention_mask = "attention_mask" in set(inspect.signature(self.forward).parameters.keys())
+        requires_attention_mask = "encoder_outputs" not in model_kwargs
+
+        if model_kwargs.get("attention_mask", None) is None and requires_attention_mask and accepts_attention_mask:
+            model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(
+                inputs_tensor, pad_token_id, eos_token_id
+            )
+
+        if self.config.is_encoder_decoder and "encoder_outputs" not in model_kwargs:
+            # if model is encoder decoder encoder_outputs are created
+            # and added to `model_kwargs`
+            model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(
+                inputs_tensor, model_kwargs, model_input_name
+            )
+
+        # 4. Prepare `input_ids` which will be used for auto-regressive generation
+        if self.config.is_encoder_decoder:
+            input_ids = self._prepare_decoder_MSA_input_ids_for_generation(
+                batch_size,
+                decoder_start_token_id=decoder_start_token_id,
+                bos_token_id=bos_token_id,
+                model_kwargs=model_kwargs,
+                device=inputs_tensor.device,
+                gen_seq_num=gen_seq_num
+            )
+        else:
+            # if decoder-only then inputs_tensor has to be `input_ids`
+            input_ids = inputs_tensor
+
+        input_ids_seq_length = input_ids.shape[-1]
+
+        # 5. Prepare `max_length` depending on other stopping criteria
+        # if `max_new_tokens` is passed, but not `max_length` -> set `max_length = max_new_tokens`
+        if max_length is None and max_new_tokens is not None:
+            max_length = max_new_tokens + input_ids_seq_length
+        elif max_length is not None and max_new_tokens is not None:
+            # Both are set, this is odd, raise a warning
+            warnings.warn(
+                "Both `max_length` and `max_new_tokens` have been set "
+                f"but they serve the same purpose. `max_length` {max_length} "
+                f"will take priority over `max_new_tokens` {max_new_tokens}.",
+                UserWarning,
+            )
+        # default to config if still None
+        max_length = max_length if max_length is not None else self.config.max_length
+        min_length = min_length if min_length is not None else self.config.min_length
+
+        if min_length is not None and min_length > max_length:
+            raise ValueError(
+                f"Unfeasable length constraints: the minimum length ({min_length}) is larger than the maximum "
+                f"length ({max_length})"
+            )
+        if input_ids_seq_length >= max_length:
+            input_ids_string = "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
+            logger.warning(
+                f"Input length of {input_ids_string} is {input_ids_seq_length}, but ``max_length`` is set to"
+                f" {max_length}. This can lead to unexpected behavior. You should consider increasing"
+                " ``config.max_length`` or ``max_length``."
+            )
+
+        # 6. determine generation mode
+        is_constraint_gen_mode = constraints is not None or force_words_ids is not None
+        is_greedy_gen_mode = (
+            (num_beams == 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode
+        )
+        is_sample_gen_mode = (
+            (num_beams == 1) and (num_beam_groups == 1) and do_sample is True and not is_constraint_gen_mode
+        )
+        is_beam_gen_mode = (
+            (num_beams > 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode
+        )
+        is_beam_sample_gen_mode = (
+            (num_beams > 1) and (num_beam_groups == 1) and do_sample is True and not is_constraint_gen_mode
+        )
+        is_group_beam_gen_mode = (num_beams > 1) and (num_beam_groups > 1) and not is_constraint_gen_mode
+
+        if num_beam_groups > num_beams:
+            raise ValueError("`num_beam_groups` has to be smaller or equal to `num_beams`")
+        if is_group_beam_gen_mode and do_sample is True:
+            raise ValueError(
+                "Diverse beam search cannot be used in sampling mode. Make sure that `do_sample` is set to `False`."
+            )
+
+        # 7. prepare distribution pre_processing samplers
+        logits_processor = self._get_logits_processor(
+            repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            encoder_no_repeat_ngram_size=encoder_no_repeat_ngram_size,
+            input_ids_seq_length=input_ids_seq_length,
+            encoder_input_ids=inputs_tensor,
+            bad_words_ids=bad_words_ids,
+            min_length=min_length,
+            max_length=max_length,
+            eos_token_id=eos_token_id,
+            forced_bos_token_id=forced_bos_token_id,
+            forced_eos_token_id=forced_eos_token_id,
+            prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+            num_beams=num_beams,
+            num_beam_groups=num_beam_groups,
+            diversity_penalty=diversity_penalty,
+            remove_invalid_values=remove_invalid_values,
+            exponential_decay_length_penalty=exponential_decay_length_penalty,
+            logits_processor=logits_processor,
+            
+        )
+
+        # 8. prepare stopping criteria
+        stopping_criteria = self._get_stopping_criteria(
+            max_length=max_length, max_time=max_time
+        )
+
+
+        # 9. go into different generation modes
+        if is_greedy_gen_mode:
+            if num_return_sequences > 1:
+                raise ValueError(
+                    f"num_return_sequences has to be 1, but is {num_return_sequences} when doing greedy search."
+                )
+
+            # 10. run greedy search
+            return self.greedy_search(
+                input_ids,
+                logits_processor=logits_processor,
+                stopping_criteria=stopping_criteria,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                output_scores=output_scores,
+                return_dict_in_generate=return_dict_in_generate,
+                synced_gpus=synced_gpus,
+                **model_kwargs,
+            )
+
+        elif is_sample_gen_mode:
+            # 10. prepare logits warper
+            def _get_logits_warper(
+                top_k: Optional[int] = None,
+                top_p: Optional[float] = None,
+                typical_p: Optional[float] = None,
+                temperature: Optional[float] = None,
+                num_beams: Optional[int] = None,
+            ) -> LogitsProcessorList:
+                """
+                This class returns a [`LogitsProcessorList`] list object that contains all relevant [`LogitsWarper`] instances
+                used for multinomial sampling.
+                """
+
+                # init warp parameters
+                top_k = top_k if top_k is not None else self.config.top_k
+                top_p = top_p if top_p is not None else self.config.top_p
+                typical_p = typical_p if typical_p is not None else self.config.typical_p
+                temperature = temperature if temperature is not None else self.config.temperature
+                # instantiate warpers list
+                warpers = LogitsProcessorList()
+
+                # the following idea is largely copied from this PR: https://github.com/huggingface/transformers/pull/5420/files
+                # all samplers can be found in `generation_utils_samplers.py`
+                if temperature is not None and temperature != 1.0:
+                    warpers.append(TemperatureLogitsWarper(temperature))
+                if top_k is not None and top_k != 0:
+                    warpers.append(TopKLogitsWarper(top_k=top_k, min_tokens_to_keep=(2 if num_beams > 1 else 1)))
+                if top_p is not None and top_p < 1.0:
+                    warpers.append(MSATopPLogitsWarper(top_p=top_p, min_tokens_to_keep=(2 if num_beams > 1 else 1)))
+                if typical_p is not None and typical_p < 1.0:
+                    warpers.append(TypicalLogitsWarper(mass=typical_p, min_tokens_to_keep=(2 if num_beams > 1 else 1)))
+                return warpers
+            logits_warper = _get_logits_warper(
+                top_k=top_k,
+                top_p=top_p,
+                typical_p=typical_p,
+                temperature=temperature,
+                num_beams=num_beams,
+            )
+
+            # 11. expand input_ids with `num_return_sequences` additional sequences per batch
+            input_ids, model_kwargs = self._expand_inputs_for_generation(
+                input_ids,
+                expand_size=num_return_sequences,
+                is_encoder_decoder=self.config.is_encoder_decoder,
+                **model_kwargs,
+            )
+
+            # 12. run sample
+            return self.sample(
+                input_ids,
+                logits_processor=logits_processor,
+                logits_warper=logits_warper,
+                stopping_criteria=stopping_criteria,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                output_scores=output_scores,
+                return_dict_in_generate=return_dict_in_generate,
+                synced_gpus=synced_gpus,
+                **model_kwargs,
+            )
+
+        elif is_beam_gen_mode:
+            if num_return_sequences > num_beams:
+                raise ValueError("`num_return_sequences` has to be smaller or equal to `num_beams`.")
+
+            if stopping_criteria.max_length is None:
+                raise ValueError("`max_length` needs to be a stopping_criteria for now.")
+
+            # 10. prepare beam search scorer
+            beam_scorer = BeamSearchScorer(
+                batch_size=batch_size,
+                num_beams=num_beams,
+                device=inputs_tensor.device,
+                length_penalty=length_penalty,
+                do_early_stopping=early_stopping,
+                num_beam_hyps_to_keep=num_return_sequences,
+            )
+            # 11. interleave input_ids with `num_beams` additional sequences per batch
+            input_ids, model_kwargs = self._expand_inputs_for_generation(
+                input_ids, expand_size=num_beams, is_encoder_decoder=self.config.is_encoder_decoder, **model_kwargs
+            )
+            # 12. run beam search
+            return self.beam_search(
+                input_ids,
+                beam_scorer,
+                logits_processor=logits_processor,
+                stopping_criteria=stopping_criteria,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                output_scores=output_scores,
+                return_dict_in_generate=return_dict_in_generate,
+                synced_gpus=synced_gpus,
+                **model_kwargs,
+            )
+
+        elif is_beam_sample_gen_mode:
+            # 10. prepare logits warper
+            logits_warper = self._get_logits_warper(
+                top_k=top_k,
+                top_p=top_p,
+                typical_p=typical_p,
+                temperature=temperature,
+                num_beams=num_beams,
+                renormalize_logits=renormalize_logits,
+            )
+
+            if stopping_criteria.max_length is None:
+                raise ValueError("`max_length` needs to be a stopping_criteria for now.")
+            # 11. prepare beam search scorer
+            beam_scorer = BeamSearchScorer(
+                batch_size=batch_size * num_return_sequences,
+                num_beams=num_beams,
+                device=inputs_tensor.device,
+                length_penalty=length_penalty,
+                do_early_stopping=early_stopping,
+            )
+
+            # 12. interleave input_ids with `num_beams` additional sequences per batch
+            input_ids, model_kwargs = self._expand_inputs_for_generation(
+                input_ids,
+                expand_size=num_beams * num_return_sequences,
+                is_encoder_decoder=self.config.is_encoder_decoder,
+                **model_kwargs,
+            )
+
+            # 13. run beam sample
+            return self.beam_sample(
+                input_ids,
+                beam_scorer,
+                logits_processor=logits_processor,
+                logits_warper=logits_warper,
+                stopping_criteria=stopping_criteria,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                output_scores=output_scores,
+                return_dict_in_generate=return_dict_in_generate,
+                synced_gpus=synced_gpus,
+                **model_kwargs,
+            )
+
+        elif is_group_beam_gen_mode:
+            if num_return_sequences > num_beams:
+                raise ValueError("`num_return_sequences` has to be smaller or equal to `num_beams`.")
+
+            if num_beams % num_beam_groups != 0:
+                raise ValueError("`num_beams` should be divisible by `num_beam_groups` for group beam search.")
+
+            if stopping_criteria.max_length is None:
+                raise ValueError("`max_length` needs to be a stopping_criteria for now.")
+
+            # 10. prepare beam search scorer
+            beam_scorer = BeamSearchScorer(
+                batch_size=batch_size,
+                num_beams=num_beams,
+                max_length=stopping_criteria.max_length,
+                device=inputs_tensor.device,
+                length_penalty=length_penalty,
+                do_early_stopping=early_stopping,
+                num_beam_hyps_to_keep=num_return_sequences,
+                num_beam_groups=num_beam_groups,
+            )
+            # 11. interleave input_ids with `num_beams` additional sequences per batch
+            input_ids, model_kwargs = self._expand_inputs_for_generation(
+                input_ids, expand_size=num_beams, is_encoder_decoder=self.config.is_encoder_decoder, **model_kwargs
+            )
+            # 12. run beam search
+            return self.group_beam_search(
+                input_ids,
+                beam_scorer,
+                logits_processor=logits_processor,
+                stopping_criteria=stopping_criteria,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                output_scores=output_scores,
+                return_dict_in_generate=return_dict_in_generate,
+                synced_gpus=synced_gpus,
+                **model_kwargs,
+            )
+
+        elif is_constraint_gen_mode:
+            if num_return_sequences > num_beams:
+                raise ValueError("`num_return_sequences` has to be smaller or equal to `num_beams`.")
+
+            if stopping_criteria.max_length is None:
+                raise ValueError("`max_length` needs to be a stopping_criteria for now.")
+
+            if num_beams <= 1:
+                raise ValueError("`num_beams` needs to be greater than 1 for constrained genertation.")
+
+            if do_sample:
+                raise ValueError("`do_sample` needs to be false for constrained generation.")
+
+            if num_beam_groups is not None and num_beam_groups > 1:
+                raise ValueError("`num_beam_groups` not supported yet for constrained generation.")
+
+            final_constraints = []
+            if constraints is not None:
+                final_constraints = constraints
+
+            if force_words_ids is not None:
+
+                def typeerror():
+                    raise ValueError(
+                        "`force_words_ids` has to either be a `List[List[List[int]]]` or `List[List[int]]`"
+                        f"of positive integers, but is {force_words_ids}."
+                    )
+
+                if not isinstance(force_words_ids, list) or len(force_words_ids) == 0:
+                    typeerror()
+
+                for word_ids in force_words_ids:
+                    if isinstance(word_ids[0], list):
+                        if not isinstance(word_ids, list) or len(word_ids) == 0:
+                            typeerror()
+                        if any(not isinstance(token_ids, list) for token_ids in word_ids):
+                            typeerror()
+                        if any(
+                            any((not isinstance(token_id, int) or token_id < 0) for token_id in token_ids)
+                            for token_ids in word_ids
+                        ):
+                            typeerror()
+
+                        constraint = DisjunctiveConstraint(word_ids)
+                    else:
+                        if not isinstance(word_ids, list) or len(word_ids) == 0:
+                            typeerror()
+                        if any((not isinstance(token_id, int) or token_id < 0) for token_id in word_ids):
+                            typeerror()
+
+                        constraint = PhrasalConstraint(word_ids)
+                    final_constraints.append(constraint)
+
+            # 10. prepare beam search scorer
+            constrained_beam_scorer = ConstrainedBeamSearchScorer(
+                constraints=final_constraints,
+                batch_size=batch_size,
+                num_beams=num_beams,
+                device=inputs_tensor.device,
+                length_penalty=length_penalty,
+                do_early_stopping=early_stopping,
+                num_beam_hyps_to_keep=num_return_sequences,
+            )
+            # 11. interleave input_ids with `num_beams` additional sequences per batch
+            input_ids, model_kwargs = self._expand_inputs_for_generation(
+                input_ids, expand_size=num_beams, is_encoder_decoder=self.config.is_encoder_decoder, **model_kwargs
+            )
+            # 12. run beam search
+            return self.constrained_beam_search(
+                input_ids,
+                constrained_beam_scorer=constrained_beam_scorer,
+                logits_processor=logits_processor,
+                stopping_criteria=stopping_criteria,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                output_scores=output_scores,
+                return_dict_in_generate=return_dict_in_generate,
+                synced_gpus=synced_gpus,
+                **model_kwargs,
+            )
+
+    def sample(
+        self,
+        input_ids: torch.LongTensor,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        logits_warper: Optional[LogitsProcessorList] = None,
+        max_length: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_scores: Optional[bool] = None,
+        return_dict_in_generate: Optional[bool] = None,
+        synced_gpus: Optional[bool] = False,
+        **model_kwargs,
+    ):
+        # init values
+        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
+        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+        if max_length is not None:
+            warnings.warn(
+                "`max_length` is deprecated in this function, use `stopping_criteria=StoppingCriteriaList(MaxLengthCriteria(max_length=max_length))` instead.",
+                UserWarning,
+            )
+            stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
+        logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
+        pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
+        eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        output_scores = output_scores if output_scores is not None else self.config.output_scores
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict_in_generate = (
+            return_dict_in_generate if return_dict_in_generate is not None else self.config.return_dict_in_generate
+        )
+
+        # init attention / hidden states / scores tuples
+        scores = () if (return_dict_in_generate and output_scores) else None
+        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
+        cross_attentions = () if (return_dict_in_generate and output_attentions) else None
+        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
+
+        # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
+        if return_dict_in_generate and self.config.is_encoder_decoder:
+            encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
+            encoder_hidden_states = (
+                model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+            )
+
+        # keep track of which sequences are already finished
+        unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
+        cur_len = input_ids.shape[-1]
+
+        this_peer_finished = False  # used by synced_gpus only
+        # auto-regressive generation
+        while True:
+
+            if synced_gpus:
+                # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
+                # The following logic allows an early break if all peers finished generating their sequence
+                this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(input_ids.device)
+                # send 0.0 if we finished, 1.0 otherwise
+                dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
+                # did all peers finish? the reduced sum will be 0.0 then
+                if this_peer_finished_flag.item() == 0.0:
+                    break
+
+            # prepare model inputs
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+
+            # forward pass to get next token
+            outputs = self(
+                **model_inputs,
+                return_dict=True,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
+
+            if synced_gpus and this_peer_finished:
+                cur_len = cur_len + 1
+                continue  # don't waste resources running the code we don't need
+
+            # next_token_logits = outputs.logits[:, -1, :]
+            next_token_logits = outputs.logits[:,:, -1, :]
+
+            # pre-process distribution
+            next_token_scores = logits_processor(input_ids, next_token_logits)
+            next_token_scores = logits_warper(input_ids, next_token_scores)
+
+            # Store scores, attentions and hidden_states when required
+            if return_dict_in_generate:
+                if output_scores:
+                    scores += (next_token_scores,)
+                if output_attentions:
+                    decoder_attentions += (
+                        (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+                    )
+                    if self.config.is_encoder_decoder:
+                        cross_attentions += (outputs.cross_attentions,)
+
+                if output_hidden_states:
+                    decoder_hidden_states += (
+                        (outputs.decoder_hidden_states,)
+                        if self.config.is_encoder_decoder
+                        else (outputs.hidden_states,)
+                    )
+
+            # sample
+            next_token_scores=next_token_scores
+            probs = nn.functional.softmax(next_token_scores, dim=-1) #brv
+            # next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            next_tokens=torch.stack([torch.multinomial(i,num_samples=1).squeeze(1) for i in probs ],dim=0)
+            # next_tokens=next_tokens.squeeze(1)
+
+            # finished sentences should have their next token be a padding token
+            if eos_token_id is not None:
+                if pad_token_id is None:
+                    raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
+            # update generated ids, model inputs, and length for next step
+            # input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            input_ids = torch.cat([input_ids, next_tokens[:,:,None]], dim=-1)
+            model_kwargs = self._update_model_kwargs_for_generation(
+                outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
+            )
+            cur_len = cur_len + 1
+
+            # if eos_token was found in one sentence, set sentence to finished
+            if eos_token_id is not None:
+                unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
+
+            # stop when each sentence is finished, or if we exceed the maximum length
+            if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
+                if not synced_gpus:
+                    break
+                else:
+                    this_peer_finished = True
+
+        if return_dict_in_generate:
+            if self.config.is_encoder_decoder:
+                return SampleEncoderDecoderOutput(
+                    sequences=input_ids,
+                    scores=scores,
+                    encoder_attentions=encoder_attentions,
+                    encoder_hidden_states=encoder_hidden_states,
+                    decoder_attentions=decoder_attentions,
+                    cross_attentions=cross_attentions,
+                    decoder_hidden_states=decoder_hidden_states,
+                )
+            else:
+                return SampleDecoderOnlyOutput(
+                    sequences=input_ids,
+                    scores=scores,
+                    attentions=decoder_attentions,
+                    hidden_states=decoder_hidden_states,
+                )
+        else:
+            return input_ids
+    @staticmethod
+    def _expand_inputs_for_generation(
+        input_ids: torch.LongTensor,
+        expand_size: int = 1,
+        is_encoder_decoder: bool = False,
+        attention_mask: torch.LongTensor = None,
+        encoder_outputs: ModelOutput = None,
+        **model_kwargs,
+    ) -> Tuple[torch.LongTensor, Dict[str, Any]]:
+        expanded_return_idx = (
+            torch.arange(input_ids.shape[0]).view(-1, 1).repeat(1, expand_size).view(-1).to(input_ids.device)
+        )
+        input_ids = input_ids.index_select(0, expanded_return_idx)
+
+        if "token_type_ids" in model_kwargs:
+            token_type_ids = model_kwargs["token_type_ids"]
+            model_kwargs["token_type_ids"] = token_type_ids.index_select(0, expanded_return_idx)
+
+        if attention_mask is not None:
+            model_kwargs["attention_mask"] = attention_mask.index_select(0, expanded_return_idx)
+
+        if is_encoder_decoder:
+            assert encoder_outputs is not None
+            encoder_outputs["last_hidden_state"] = encoder_outputs.last_hidden_state.index_select(
+                0, expanded_return_idx.to(encoder_outputs.last_hidden_state.device)
+            )
+            model_kwargs["encoder_outputs"] = encoder_outputs
+        return input_ids, model_kwargs
+    def _get_stopping_criteria(
+        self,
+        max_length: Optional[int],
+        max_time: Optional[float],
+    ) -> StoppingCriteriaList:
+        stopping_criteria = StoppingCriteriaList()
+        if max_length is not None:
+            stopping_criteria.append(MaxLengthCriteria(max_length=max_length))
+        if max_time is not None:
+            stopping_criteria.append(MaxTimeCriteria(max_time=max_time))
+        return stopping_criteria
     def greedy_search(
         self,
         input_ids: torch.LongTensor,
@@ -1876,7 +2569,9 @@ class MSA_AUGMENTOR(T5PreTrainedModel):
             encoder_hidden_states = (
                 model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
             )
-        
+       
+
+
         # keep track of which sequences are already finished
         unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
         cur_len = input_ids.shape[-1]
@@ -1898,12 +2593,12 @@ class MSA_AUGMENTOR(T5PreTrainedModel):
             
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-            
-            # print("input_ids shape: ",model_inputs["decoder_input_ids"].shape)
-            # print('input_ids: ',model_inputs["decoder_input_ids"])
-            # print('model_kwargs.keys() ',model_kwargs.keys())
-            # print('attention_mask shape: ',model_kwargs['attention_mask'].shape)
-            # print('encoder_outputs: ',model_kwargs['encoder_outputs'].last_hidden_state.shape)
+            if self.debug:
+                print("greedy_search: input_ids shape: ",model_inputs["decoder_input_ids"].shape)
+                print('greedy_search: input_ids: ',model_inputs["decoder_input_ids"])
+                print('greedy_search: model_kwargs.keys() ',model_kwargs.keys())
+                print('greedy_search: attention_mask shape: ',model_kwargs['attention_mask'].shape)
+                print('greedy_search: encoder_outputs: ',model_kwargs['encoder_outputs'].last_hidden_state.shape)
             # forward pass to get next token
             outputs = self(
                 **model_inputs,
@@ -1917,9 +2612,8 @@ class MSA_AUGMENTOR(T5PreTrainedModel):
             if synced_gpus and this_peer_finished:
                 cur_len = cur_len + 1
                 continue  # don't waste resources running the code we don't need
-
+            
             next_token_logits = outputs.logits[:,:, -1, :]
-
             # Store scores, attentions and hidden_states when required
             if return_dict_in_generate:
                 if output_scores:
@@ -1949,10 +2643,10 @@ class MSA_AUGMENTOR(T5PreTrainedModel):
                 if pad_token_id is None:
                     raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
                 next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
-            # print('next_tokens shape: ',next_tokens.shape)
+        
             # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens[:,:, None]], dim=-1)
-            # print('input_ids shape',input_ids.shape)
+     
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
@@ -1990,7 +2684,100 @@ class MSA_AUGMENTOR(T5PreTrainedModel):
                 )
         else:
             return input_ids
-        
+    def _get_logits_processor(
+        self,
+        repetition_penalty: float,
+        no_repeat_ngram_size: int,
+        encoder_no_repeat_ngram_size: int,
+        input_ids_seq_length: int,
+        encoder_input_ids: torch.LongTensor,
+        bad_words_ids: List[List[int]],
+        min_length: int,
+        max_length: int,
+        eos_token_id: int,
+        forced_bos_token_id: int,
+        forced_eos_token_id: int,
+        prefix_allowed_tokens_fn: Callable[[int, torch.Tensor], List[int]],
+        num_beams: int,
+        num_beam_groups: int,
+        diversity_penalty: float,
+        remove_invalid_values: bool,
+        exponential_decay_length_penalty: Tuple,
+        logits_processor: Optional[LogitsProcessorList],
+    ) -> LogitsProcessorList:
+        """
+        This class returns a [`LogitsProcessorList`] list object that contains all relevant [`LogitsProcessor`]
+        instances used to modify the scores of the language model head.
+        """
+        processors = LogitsProcessorList()
+
+        # init warp parameters
+        repetition_penalty = repetition_penalty if repetition_penalty is not None else self.config.repetition_penalty
+        no_repeat_ngram_size = (
+            no_repeat_ngram_size if no_repeat_ngram_size is not None else self.config.no_repeat_ngram_size
+        )
+        encoder_no_repeat_ngram_size = (
+            encoder_no_repeat_ngram_size
+            if encoder_no_repeat_ngram_size is not None
+            else self.config.encoder_no_repeat_ngram_size
+        )
+        bad_words_ids = bad_words_ids if bad_words_ids is not None else self.config.bad_words_ids
+        min_length = min_length if min_length is not None else self.config.min_length
+        eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        diversity_penalty = diversity_penalty if diversity_penalty is not None else self.config.diversity_penalty
+        forced_bos_token_id = (
+            forced_bos_token_id if forced_bos_token_id is not None else self.config.forced_bos_token_id
+        )
+        forced_eos_token_id = (
+            forced_eos_token_id if forced_eos_token_id is not None else self.config.forced_eos_token_id
+        )
+        remove_invalid_values = (
+            remove_invalid_values if remove_invalid_values is not None else self.config.remove_invalid_values
+        )
+        exponential_decay_length_penalty = (
+            exponential_decay_length_penalty
+            if exponential_decay_length_penalty is not None
+            else self.config.exponential_decay_length_penalty
+        )
+        # instantiate processors list
+
+        # the following idea is largely copied from this PR: https://github.com/huggingface/transformers/pull/5420/files
+        # all samplers can be found in `generation_utils_samplers.py`
+        if diversity_penalty is not None and diversity_penalty > 0.0:
+            processors.append(
+                HammingDiversityLogitsProcessor(
+                    diversity_penalty=diversity_penalty, num_beams=num_beams, num_beam_groups=num_beam_groups
+                )
+            )
+        if repetition_penalty is not None and repetition_penalty != 1.0:
+            processors.append(MSARepetitionPenaltyLogitsProcessor(penalty=repetition_penalty))
+        if no_repeat_ngram_size is not None and no_repeat_ngram_size > 0:
+            processors.append(NoRepeatNGramLogitsProcessor(no_repeat_ngram_size))
+        if encoder_no_repeat_ngram_size is not None and encoder_no_repeat_ngram_size > 0:
+            if self.config.is_encoder_decoder:
+                processors.append(EncoderNoRepeatNGramLogitsProcessor(encoder_no_repeat_ngram_size, encoder_input_ids))
+            else:
+                raise ValueError(
+                    "It's impossible to use `encoder_no_repeat_ngram_size` with decoder-only architecture"
+                )
+        if bad_words_ids is not None:
+            processors.append(NoBadWordsLogitsProcessor(bad_words_ids, eos_token_id))
+        if min_length is not None and eos_token_id is not None and min_length > 0:
+            processors.append(MSAMinLengthLogitsProcessor(min_length, eos_token_id))
+        if prefix_allowed_tokens_fn is not None:
+            processors.append(PrefixConstrainedLogitsProcessor(prefix_allowed_tokens_fn, num_beams // num_beam_groups))
+        if forced_bos_token_id is not None:
+            processors.append(ForcedBOSTokenLogitsProcessor(forced_bos_token_id))
+        if forced_eos_token_id is not None:
+            processors.append(ForcedEOSTokenLogitsProcessor(max_length, forced_eos_token_id))
+        if remove_invalid_values is True:
+            processors.append(InfNanRemoveLogitsProcessor())
+        if exponential_decay_length_penalty is not None:
+            processors.append(
+                ExponentialDecayLengthPenalty(exponential_decay_length_penalty, eos_token_id, input_ids_seq_length)
+            )
+        processors = self._merge_criteria_processor_list(processors, logits_processor)
+        return processors
 def validate_stopping_criteria(stopping_criteria: StoppingCriteriaList, max_length: int) -> StoppingCriteriaList:
     stopping_max_length = stopping_criteria.max_length
     new_stopping_criteria = deepcopy(stopping_criteria)

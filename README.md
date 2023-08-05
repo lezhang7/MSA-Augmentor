@@ -1,29 +1,35 @@
-Pretraining code for [paper](https://arxiv.org/abs/2306.01824) 
-# MSA-Augmentor pretraining code
 
-    |_config -> config settings for the model
-    |_data -> .bin dataset construct pipeline
-	    |_utils.py -> class for MSA dataset and binary dataset construction method
-	    |_construct_binary_dataset.sh 
-    |_datasets -> .bin dataset
-    |_model -> model files
-    |_install.sh -> deepspeed install shell script
-    |_train_trainer.py -> pertraining file (huggingface trainer)
-    |_run.sh -> pretraining shell script     
+
+# MSA-Augmentor codebase
+
+codebase for paper **Enhancing the Protein Tertiary Structure Prediction by Multiple Sequence Alignment Generation** [arxiv](https://arxiv.org/pdf/2210.07920.pdf)
 
 # Pretraining steps
-**All the commands are designed for shlab cluster**
 
- 1. Construct local binary dataset ( load training data from cluster is too slow, so it's better to  fisrt construct all your dataset to .bin file as shown in datasets )
+**All the commands are designed for slurm cluster, we use huggingface trainer to pretrain the model, more details could be find [here](https://huggingface.co/docs/transformers/main_classes/trainer)**
+
+  1. Construct local binary dataset ( load training data from cluster is too slow, so it's better to  fisrt construct all your dataset to .bin file as shown in datasets )
+
  ```
- srun -p CM2M -n 1 --cpus-per-task 32 python utils.py \
- 	--output_dir /mnt/lustre/zhangle/projects/msat5/datasets/ \
-	--random_src --src_seq_per_msa_l 5\
-	--src_seq_per_msa_u 10 \
-	--total_seq_per_msa 25 \
-	--local_file_path  path to pretrained dataset   # e.g ./projects/msa_augmentor/datasets/sorted_msa
+python utils.py \
+   --output_dir ./datasets/ \
+   --random_src --src_seq_per_msa_l 5\
+   --src_seq_per_msa_u 10 \
+   --total_seq_per_msa 25 \
+   --local_file_path  path_to_pretrained_dataset 
  ```
- change the parameters above you can construct your own binary dataset
- 
- 2. Install dependent libraries, including pytorch transformer as well deepspeed.
- 3. Start pretraining using run.sh script, you can modify the parameter in the script!
+
+  2. install dependency libraries `pip install -r requirements.txt`
+  3. `bash run.sh` 
+
+# Inference
+
+1. download [checkpoints](https://drive.google.com/file/d/12cYk3WZDX18j-9xwYK9uu2kaGjmLuowB/view) 
+2. run inference by `bash scripts/inference.sh`
+
+*Note: all inference code is in inference.py*
+
+# Evaluation
+
+Please refer to [Alphafold2 GitHub](https://github.com/deepmind/alphafold) to learn more about folding and evaluation with ground truth protein structure
+
