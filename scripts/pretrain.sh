@@ -2,7 +2,7 @@
 cd ..
 GPU_NUM=8
 BS=6
-PATH_TO_TRAINING_DATA="/datasets/MSA_10K"
+PATH_TO_TRAINING_DATA="./datasets/MSA_10K"
 
 srun -N 1 --ntasks-per-node=1 --gres=gpu:$GPU_NUM --job-name=MSAT5_BASE \
     deepspeed --master_port 13245 pretrain.py \
@@ -51,8 +51,8 @@ srun -N 1 --ntasks-per-node=1 --gres=gpu:$GPU_NUM --job-name=MSAT5_BASE \
 #     --evaluation_strategy steps \
 #     --save_steps 20000 \
 #     --fp16 \
-#     --local_msadataset_path /mnt/lustre/zhangle/projects/msat5/datasets/MSA_10K \
-#     --logging_dir /mnt/lustre/zhangle/projects/msat5/tmp/test1/runs/1
+#     --local_msadataset_path./datasets/MSA_10K \
+#     --logging_dir ./test1/runs/1
 
     
 
