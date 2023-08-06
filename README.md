@@ -6,19 +6,19 @@ codebase for paper **Enhancing the Protein Tertiary Structure Prediction by Mult
 
 **All the commands are designed for slurm cluster, we use huggingface trainer to pretrain the model, more details could be find [here](https://huggingface.co/docs/transformers/main_classes/trainer)**
 
-       1. Construct local binary dataset ( load training data from cluster is too slow, so it's better to  fisrt construct all your dataset to .bin file as shown in datasets )
+   1. Construct local binary dataset ( load training data from cluster is too slow, so it's better to  fisrt construct all your dataset to .bin file as shown in datasets )
 
- ```
-python utils.py \
-   --output_dir ./datasets/ \
-   --random_src --src_seq_per_msa_l 5\
-   --src_seq_per_msa_u 10 \
-   --total_seq_per_msa 25 \
-   --local_file_path  path_to_pretrained_dataset 
- ```
+      ```
+      python utils.py \
+         --output_dir ./datasets/ \
+         --random_src --src_seq_per_msa_l 5\
+         --src_seq_per_msa_u 10 \
+         --total_seq_per_msa 25 \
+         --local_file_path  path_to_pretrained_dataset 
+      ```
 
-       2. install dependency libraries `pip install -r requirements.txt`
-          3. `bash run.sh` 
+   2. install dependency libraries `pip install -r requirements.txt`
+   3. `bash run.sh` 
 
 # Inference
 
