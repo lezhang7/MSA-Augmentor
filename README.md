@@ -1,9 +1,5 @@
 # MSA-Augmentor codebase
 
-<img src="https://p.ipic.vip/2ie9ol.png" alt="introduction (1)" style="zoom: 25%;" />
-
-
-
 <img src="https://p.ipic.vip/9l6wrb.png" alt="method (1)" style="zoom: 25%;" />
 
 codebase for paper **Enhancing the Protein Tertiary Structure Prediction by Multiple Sequence Alignment Generation** [arxiv](https://arxiv.org/abs/2306.01824)
