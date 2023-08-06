@@ -44,8 +44,8 @@ codebase for paper **Enhancing the Protein Tertiary Structure Prediction by Mult
 
 ### LDDT
 
-please follow this document for lddt evaluation tool download https://www.openstructure.org/
-and this document for https://www.openstructure.org/docs/2.4/mol/alg/lddt/ usage
+ 1. follow this document for lddt evaluation tool download https://www.openstructure.org/
+ 2. follow this document for https://www.openstructure.org/docs/2.4/mol/alg/lddt/ usage
 
 ### Ensemble
 
