@@ -31,7 +31,7 @@ python utils.py \
 
 | DATASET | MSA                               | STRUCTURE                                                    |
 | ------- | --------------------------------- | ------------------------------------------------------------ |
-| CASP15  | https://zenodo.org/record/8126538 | https://github.com/deepmind/alphafold/blob/main/docs/casp15_predictions.zip |
+| CASP15  | https://zenodo.org/record/8126538 | [google drive](https://github.com/deepmind/alphafold/blob/main/docs/casp15_predictions.zip) |
 
 ### Alphafold2 Prediction
 
@@ -45,9 +45,9 @@ python utils.py \
 
 2. modify these variables in `eval_lddt.py`
 
-   -  `lddt` *Fast_lDDT software path*
-   -  `seqdir     `*Path to Directory with only query .seq file (the first seq of each msa file)*
-   -  `native`  ground truth .pdb folder dir
+   -  `lddt`   *Fast_lDDT software path*
+   -  `seqdir` *Path to Directory with only query .seq file (the first seq of each msa file)*
+   -  `native` ground truth .pdb folder dir
 
 3. running following code to evaluate lddt score with ground truth .pdb file
    ```python eval_lddt.py --predicted_pdb_root_dir $predicted_pdb_dir # e.g ./af2/casp15/orphan/A1T3R1.5/```
