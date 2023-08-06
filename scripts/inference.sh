@@ -16,9 +16,9 @@ cd /home/mila/l/le.zhang/scratch/github_clone/MSA-Augmentor
 
 python inference.py \
    --checkpoints ./checkpoints/msat5-base/checkpoint-740000/ \
-   --data_path ./dataset/casp15/cfdb/ \
+   --data_path /home/mila/l/le.zhang/scratch/github_clone/MSA-Augmentor/dataset/casp15/cfdb \
    --do_predict \
    --mode orphan \
    --a 1 \
-   --t 3\
-   --repetition_penalty 2 \
+   --t 10\
+   --repetition_penalty 1.0 \

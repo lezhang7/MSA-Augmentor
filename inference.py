@@ -28,7 +28,7 @@ def msa_generate(args,model,dataset,msa_collator,tokenizer):
     Generate msa for given dataset
     """
     with torch.no_grad():
-        output_dir=os.path.join(args.output_dir,'casp15',args.mode,f"A{args.augmentation_times}T{args.trials_times}R{args.repetition_penalty}")
+        output_dir=os.path.join(args.output_dir,args.dataset,args.mode,f"A{args.augmentation_times}T{args.trials_times}R{args.repetition_penalty}")
         args_dict = vars(args)
         os.makedirs(output_dir,exist_ok=True)
         with open(os.path.join(output_dir,'params.json'), 'w') as f:
@@ -40,14 +40,19 @@ def msa_generate(args,model,dataset,msa_collator,tokenizer):
             src_ids=msa_collator.msa_batch_convert(msa).to('cuda:0')
             _,original_seq_num,original_seq_len=src_ids.size()
             for trial in range(args.trials_times):
+                msa_output_dir=os.path.join(output_dir,msa_name)
+                os.makedirs(msa_output_dir,exist_ok=True)
+                a3m_file_name=os.path.join(msa_output_dir,f"generation_{trial}.a3m")
+                if os.path.exists(a3m_file_name):
+                    logger.info(f'File {a3m_file_name} already exists, skip')
+                    continue               
                 output=model.generate(src_ids,do_sample=True,top_k=5,top_p=0.95,repetition_penalty=args.repetition_penalty, \
                                     max_length=original_seq_len+1,gen_seq_num=original_seq_num*args.augmentation_times) 
                 
                 generate_seq=[tokenizer.decode(seq_token,skip_special_tokens=True).replace(' ','') for seq_token in output[0]]
                 generate_seq=list(filter(lambda x: len(set(x))>5, generate_seq)) # filter our sequences with all gap '-'
-                msa_output_dir=os.path.join(output_dir,msa_name)
-                os.makedirs(msa_output_dir,exist_ok=True)
-                with open(os.path.join(msa_output_dir,f"generation_{trial}.a3m"),'w') as fw:
+                
+                with open(a3m_file_name,'w') as fw:
                     generate_msa_list=[]
         
                     for original_seq in msa:
@@ -63,20 +68,6 @@ def msa_generate(args,model,dataset,msa_collator,tokenizer):
                     fw.write("\n".join(generate_msa_list))
                     logger.info(f'Generate successful for {msa_name} trial: {trial}')
 
-# def msa_alignments_copy(generate_folder_path:str, all:int):
-#     folders=os.listdir(generate_folder_path+'generate/') 
-#     for folder in folders: #generate_500
-#         target_folder_path=generate_folder_path+'Gen_n_test/{}/'.format(folder)
-#         target_msa=os.listdir(generate_folder_path+'generate/{}/'.format(folder))[0] #xxxx.a3m
-#         os.makedirs(target_folder_path,exist_ok=True)
-#         with open(generate_folder_path+'generate/'+folder+'/'+target_msa) as fr:
-#             contend=fr.readlines()
-#             for i in list(range(all))[2::2]:
-#                 i+=1
-#                 target_file=target_folder_path+target_msa.replace('generate','generate_{}'.format(i))
-#                 with open(target_file,'w') as fw:
-#                     fw.write("".join(contend[:i*2]))
-#     return generate_folder_path+'generate_n_test/'
 
 
 def inference(args):
@@ -113,6 +104,10 @@ def parsing_arguments():
     parser.add_argument('-a','--augmentation_times',type=int,default=1,help="times of generated quality compared to original msa x1 x3 x5")
     parser.add_argument('-t','--trials_times',type=int,default=5)    
     args=parser.parse_args()
+    if 'casp14' in args.data_path:
+        args.dataset='casp14'
+    elif 'casp15' in args.data_path:
+        args.dataset='casp15'
     assert not (args.do_train and args.do_predict), "select one mode from train and predict"
     return args
     

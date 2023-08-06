@@ -4,3 +4,4 @@ dataset/
 checkpoints/
 pretraining_datasets/
 *.ipynb
+*.tar.gz

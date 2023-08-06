@@ -28,8 +28,10 @@ from torch.nn import CrossEntropyLoss
 from torch.utils.checkpoint import checkpoint
 from dataclasses import dataclass
 from transformers import LogitsProcessorList,StoppingCriteriaList,T5Config
-from transformers.generation.beam_constraints import Constraint, DisjunctiveConstraint, PhrasalConstraint
-from transformers.generation.beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
+# from transformers.generation.beam_constraints import Constraint, DisjunctiveConstraint, PhrasalConstraint
+# from transformers.generation.beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
+from transformers.generation_beam_constraints import Constraint, DisjunctiveConstraint, PhrasalConstraint
+from transformers.generation_beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
 from transformers.activations import ACT2FN
 from transformers.file_utils import (
     DUMMY_INPUTS,
@@ -45,7 +47,15 @@ from transformers.modeling_outputs import (
 from transformers.modeling_utils import PreTrainedModel, find_pruneable_heads_and_indices, prune_linear_layer
 from transformers.utils import logging,ModelOutput
 from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
-from transformers.generation.stopping_criteria import (
+# from transformers.generation.stopping_criteria import (
+#     MaxLengthCriteria,
+#     MaxTimeCriteria,
+#     StoppingCriteria,
+#     StoppingCriteriaList,
+#     validate_stopping_criteria,
+# )
+
+from transformers.generation_stopping_criteria import (
     MaxLengthCriteria,
     MaxTimeCriteria,
     StoppingCriteria,
@@ -53,7 +63,25 @@ from transformers.generation.stopping_criteria import (
     validate_stopping_criteria,
 )
 
-from transformers.generation.logits_process import (
+# from transformers.generation.logits_process import (
+#     EncoderNoRepeatNGramLogitsProcessor,
+#     ExponentialDecayLengthPenalty,
+#     ForcedBOSTokenLogitsProcessor,
+#     ForcedEOSTokenLogitsProcessor,
+#     HammingDiversityLogitsProcessor,
+#     InfNanRemoveLogitsProcessor,
+#     LogitsProcessorList,
+#     MinLengthLogitsProcessor,
+#     NoBadWordsLogitsProcessor,
+#     NoRepeatNGramLogitsProcessor,
+#     PrefixConstrainedLogitsProcessor,
+#     RepetitionPenaltyLogitsProcessor,
+#     TemperatureLogitsWarper,
+#     TopKLogitsWarper,
+#     TopPLogitsWarper,
+#     TypicalLogitsWarper,
+# )
+from transformers.generation_logits_process import (
     EncoderNoRepeatNGramLogitsProcessor,
     ExponentialDecayLengthPenalty,
     ForcedBOSTokenLogitsProcessor,
@@ -2037,7 +2065,7 @@ class MSAT5(T5PreTrainedModel):
 
         # 8. prepare stopping criteria
         stopping_criteria = self._get_stopping_criteria(
-            max_length=max_length, max_time=max_time
+            max_length=max_length, max_time=max_time,stopping_criteria=stopping_criteria
         )
 
 
@@ -2511,17 +2539,17 @@ class MSAT5(T5PreTrainedModel):
             )
             model_kwargs["encoder_outputs"] = encoder_outputs
         return input_ids, model_kwargs
-    def _get_stopping_criteria(
-        self,
-        max_length: Optional[int],
-        max_time: Optional[float],
-    ) -> StoppingCriteriaList:
-        stopping_criteria = StoppingCriteriaList()
-        if max_length is not None:
-            stopping_criteria.append(MaxLengthCriteria(max_length=max_length))
-        if max_time is not None:
-            stopping_criteria.append(MaxTimeCriteria(max_time=max_time))
-        return stopping_criteria
+    # def _get_stopping_criteria(
+    #     self,
+    #     max_length: Optional[int],
+    #     max_time: Optional[float],
+    # ) -> StoppingCriteriaList:
+    #     stopping_criteria = StoppingCriteriaList()
+    #     if max_length is not None:
+    #         stopping_criteria.append(MaxLengthCriteria(max_length=max_length))
+    #     if max_time is not None:
+    #         stopping_criteria.append(MaxTimeCriteria(max_time=max_time))
+    #     return stopping_criteria
     def greedy_search(
         self,
         input_ids: torch.LongTensor,
