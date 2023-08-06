@@ -62,19 +62,3 @@ Directly run following to get .json file of final results.
 
 ```python ensemble.py --predicted_pdb_root_dir ./af2/casp15/orphan/A1T3R1.5/```
 
-# :paperclip: Citation
-
-``````bibtex
-@misc{zhang2023enhancing,
-      title={Enhancing the Protein Tertiary Structure Prediction by Multiple Sequence Alignment Generation}, 
-      author={Le Zhang and Jiayang Chen and Tao Shen and Yu Li and Siqi Sun},
-      year={2023},
-      eprint={2306.01824},
-      archivePrefix={arXiv},
-      primaryClass={q-bio.QM}
-}
-``````
-
-# :email: Contact
-
-please let us know if you have further questions or comments, reach out to [le.zhang@mila.quebec](
